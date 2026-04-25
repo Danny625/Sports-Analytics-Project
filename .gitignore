@@ -1,0 +1,11 @@
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+.DS_Store
+Thumbs.db
+r-lib/
+danny_net_era_analysis_cache/
+danny_net_era_analysis_files/
+analysis_outputs/
+danny_net_era_analysis.html
