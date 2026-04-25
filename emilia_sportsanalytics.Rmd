@@ -1,0 +1,232 @@
+---
+title: "NCAA Tournament Seeding: Baseline Expected-Seed Model"
+author: "Emilia Brusseau"
+date: "4/24/2026`"
+output:
+  pdf_document:
+    toc: false
+header-includes:
+  - \usepackage{float}
+  - \floatplacement{figure}{H}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+library(cbbdata)
+library(tidyverse)
+library(nnet)
+library(broom)
+library(knitr)
+library(kableExtra)
+library(boot)
+library(caret)
+cbbdata::cbd_login(username = "emiliabrusseau", password = "emilia2004")
+```
+
+```{r data}
+model_data <- cbd_torvik_ratings() %>%
+  as_tibble() %>%
+  filter(!is.na(seed), seed >= 1, seed <= 16) %>%
+  filter(year != 2020) %>%
+  drop_na() %>%
+  select(
+    team, year, seed,
+    adj_o,
+    adj_d,
+    adj_em = adj_t,
+    barthag,
+    wab,
+    sos = nc_elite_sos
+  ) %>%
+  mutate(
+    seed_factor = factor(seed, levels = 1:16),
+    year = as.integer(year)
+  ) %>%
+  mutate(across(c(adj_o, adj_d, adj_em, barthag, wab, sos),
+                ~ scale(.)[, 1],
+                .names = "{.col}_z"))
+```
+
+```{r split}
+set.seed(36460)
+train_idx <- createDataPartition(model_data$seed_factor, p = 0.8, list = FALSE)
+train_df  <- model_data[ train_idx, ]
+test_df   <- model_data[-train_idx, ]
+```
+
+```{r models}
+m1 <- multinom(
+  seed_factor ~ adj_o_z + adj_d_z + barthag_z,
+  data = train_df, MaxNWts = 10000, maxit = 500, trace = FALSE
+)
+
+m2 <- multinom(
+  seed_factor ~ wab_z + sos_z,
+  data = train_df, MaxNWts = 10000, maxit = 500, trace = FALSE
+)
+
+m3 <- multinom(
+  seed_factor ~ adj_o_z + adj_d_z + barthag_z + wab_z + sos_z,
+  data = train_df, MaxNWts = 10000, maxit = 500, trace = FALSE
+)
+```
+
+```{r helpers}
+pred_seed <- function(model, newdata) {
+  probs <- predict(model, newdata = newdata, type = "probs")
+  result <- apply(probs, 1, function(row) as.integer(names(which.max(row))))
+  as.integer(unlist(result))
+}
+
+mae_seed <- function(model, newdata) {
+  mean(abs(pred_seed(model, newdata) - as.integer(as.character(newdata$seed_factor))))
+}
+
+acc_seed <- function(model, newdata) {
+  mean(pred_seed(model, newdata) == as.integer(as.character(newdata$seed_factor)))
+}
+
+within2_seed <- function(model, newdata) {
+  mean(abs(pred_seed(model, newdata) - as.integer(as.character(newdata$seed_factor))) <= 2)
+}
+
+logloss_seed <- function(model, newdata) {
+  probs    <- as.matrix(predict(model, newdata = newdata, type = "probs"))
+  true_lab <- as.integer(as.character(newdata$seed_factor))
+  probs    <- pmax(pmin(probs, 1 - 1e-15), 1e-15)
+  true_probs <- sapply(seq_len(nrow(probs)), function(i) {
+    probs[i, as.character(true_lab[i])]
+  })
+  -mean(log(true_probs))
+}
+
+test_df <- test_df %>%
+  mutate(pred_seed_m3 = pred_seed(m3, test_df))
+```
+
+## Emilia Brusseau: Baseline Expected-Seed Model
+
+### Methods
+
+The goal of this analysis is to figure out which publicly available team metrics best explain how the NCAA selection committee assigns tournament seeds. If seeding is mostly driven by objective performance metrics, then a model built on those metrics should be able to predict seeds pretty accurately. When the model is off, those differences highlight where the committee is relying on something beyond the numbers and those residuals are what the rest of our project focuses on.
+
+The outcome variable is NCAA tournament seed (1 through 16), which I treat as a 16-category unordered variable and model using multinomial logistic regression with `nnet::multinom()`. I’m not using an ordinal model because that would assume the gaps between seeds are evenly spaced, which doesn’t really make sense here. The difference between a 1 and 2 seed is not the same as between an 8 and 9 seed in terms of matchup difficulty or tournament path. The multinomial model avoids that by estimating separate log-odds for each seed relative to a reference category (seed 1), without forcing equal spacing. The model assumes these log-odds are a linear function of the predictors and that each team-season is independent.
+
+The data come from Barttorvik’s database through the `cbbdata` R package and include all 1,078 tournament teams from 2008 to 2024 (excluding 2020 since the tournament was cancelled). All predictors are measured as of Selection Sunday, so the model only uses information the committee actually had at the time. I standardize all predictors to have mean 0 and standard deviation 1 so the coefficients are directly comparable across variables.
+
+To break down what actually drives seeding, I compare three nested models:
+
+- **M1 (Efficiency only):** adjusted offensive efficiency, adjusted defensive efficiency, and Barthag (a power rating that reflects expected win probability against an average Division I team). I leave out adjusted efficiency margin since it’s basically a combination of offense and defense and would cause collinearity issues.
+- **M2 (Resume only):** Wins Above Bubble (WAB), which captures how a team performed relative to a bubble-level team given the same schedule, and non-conference elite strength of schedule.
+- **M3 (Combined):** all five predictors together.
+
+I fit all models using a stratified 80/20 train/test split (stratified by seed so every seed appears in both sets). I evaluate performance on the holdout set using AIC (on the training data), mean absolute error in seed units, exact seed accuracy, within-2-seeds accuracy, and multinomial log-loss.
+
+To quantify uncertainty, I use a nonparametric bootstrap with 200 resamples of the training data. This gives 95% confidence intervals for each predictor’s average absolute coefficient, which I use to compare their overall importance in the model.
+
+### Results
+
+```{r eda-plots, fig.height=3.5, fig.cap="WAB (left) shows a tighter, more linear relationship with seed than adjusted efficiency margin (right), suggesting the committee weights resume-based metrics heavily in seeding decisions. Each point is one tournament team-season, 2008-2024."}
+p1 <- ggplot(model_data, aes(x = wab, y = seed)) +
+  geom_jitter(alpha = 0.25, width = 0, height = 0.3, color = "steelblue") +
+  geom_smooth(method = "loess", se = TRUE, color = "black") +
+  scale_y_reverse(breaks = c(1, 4, 8, 12, 16)) +
+  labs(x = "Wins Above Bubble (WAB)", y = "NCAA Seed", title = "Seed vs. WAB") +
+  theme_minimal(base_size = 10)
+
+p2 <- ggplot(model_data, aes(x = adj_em, y = seed)) +
+  geom_jitter(alpha = 0.25, width = 0, height = 0.3, color = "tomato") +
+  geom_smooth(method = "loess", se = TRUE, color = "black") +
+  scale_y_reverse(breaks = c(1, 4, 8, 12, 16)) +
+  labs(x = "Adjusted Efficiency Margin", y = "NCAA Seed", title = "Seed vs. Efficiency Margin") +
+  theme_minimal(base_size = 10)
+
+gridExtra::grid.arrange(p1, p2, ncol = 2)
+```
+
+```{r eval-table}
+eval_table <- tibble(
+  Model            = c("M1: Efficiency Only", "M2: Resume Only", "M3: Combined"),
+  AIC              = round(c(AIC(m1), AIC(m2), AIC(m3)), 1),
+  `Mean Abs Error` = round(c(mae_seed(m1, test_df), mae_seed(m2, test_df), mae_seed(m3, test_df)), 3),
+  `Exact Accuracy` = round(c(acc_seed(m1, test_df), acc_seed(m2, test_df), acc_seed(m3, test_df)), 3),
+  `Within-2 Acc`   = round(c(within2_seed(m1, test_df), within2_seed(m2, test_df), within2_seed(m3, test_df)), 3),
+  `Log-Loss`       = round(c(logloss_seed(m1, test_df), logloss_seed(m2, test_df), logloss_seed(m3, test_df)), 3)
+)
+
+eval_table %>%
+  kable(
+    caption = "Holdout set performance across three models. M3 outperforms both single-category models on every metric, shwoing that efficiency and resume metrics each carry independent signal for seeding. M2 outperforms M1 by a larger margin than M3 outperforms M2, showing that resume metrics are the dominant driver.",
+    booktabs = TRUE
+  ) %>%
+  kable_styling(latex_options = c("hold_position", "striped"), full_width = FALSE) %>%
+  row_spec(which.min(eval_table$`Log-Loss`), bold = TRUE)
+```
+
+The combined model (M3) correctly predicts the exact seed for 33.2% of teams in the holdout set and is within two seeds for 86.3% of teams, with a mean absolute error of 1.14 seed lines. This outperforms both M1 (efficiency only) and M2 (resume only), which suggests that both types of metrics matter and are capturing different pieces of the selection process.
+
+That said, the improvement from M1 to M2 is much larger than from M2 to M3 (AIC drops by 302 vs. 167), which points to resume-based metrics as the main thing the committee is using. Efficiency metrics still add value, but more  secondary  rather than the primary driver.
+
+```{r pred-plot, fig.height=4, fig.pos="H", out.width="80%", fig.cap="Predicted versus actual seed for M3 on the holdout set. The dashed line represents a perfect prediction. The model tracks the committee well across the full range of seeds, with most errors confined to adjacent seed lines. The largest deviations occur in the middle of the seed distribution (seeds 7-11), where the committee has the most discretion."}
+ggplot(test_df, aes(x = seed, y = pred_seed_m3)) +
+  geom_jitter(alpha = 0.4, width = 0.2, height = 0.2, color = "steelblue") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "black") +
+  scale_x_continuous(breaks = c(1, 4, 8, 12, 16)) +
+  scale_y_continuous(breaks = c(1, 4, 8, 12, 16)) +
+  labs(x = "Actual Seed", y = "Predicted Seed") +
+  theme_minimal(base_size = 11)
+```
+
+```{r coef-plot, fig.height=3.5, fig.pos="H", out.width="90%", fig.cap="Average absolute log-odds coefficient by predictor in M3, with 95 percent bootstrap confidence intervals (B = 200). WAB dominates by a wide margin, with an average coefficient around 1.4 times larger than Barthag and 6 times larger than the efficiency components. The non-overlapping intervals for WAB and Barthag versus adj\\_o, adj\\_d, and sos prove that this ordering is stable across resamples."}
+coef_m3 <- coef(m3)
+
+avg_abs_coef <- coef_m3[, -1] %>%
+  abs() %>%
+  colMeans() %>%
+  sort(decreasing = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column("Predictor") %>%
+  rename(Estimate = ".")
+
+boot_coef_fn <- function(data, indices) {
+  d <- data[indices, ]
+  m <- tryCatch(
+    multinom(
+      seed_factor ~ adj_o_z + adj_d_z + barthag_z + wab_z + sos_z,
+      data = d, MaxNWts = 10000, maxit = 300, trace = FALSE
+    ),
+    error = function(e) NULL
+  )
+  if (is.null(m)) return(rep(NA, ncol(coef(m3)) - 1))
+  coef(m)[, -1] %>% abs() %>% colMeans()
+}
+
+set.seed(36460)
+boot_out <- boot(data = train_df, statistic = boot_coef_fn, R = 200)
+pred_names <- colnames(coef(m3))[-1]
+
+boot_ci_df <- map_dfr(seq_along(pred_names), function(i) {
+  ci <- tryCatch(
+    boot.ci(boot_out, index = i, type = "perc")$percent[4:5],
+    error = function(e) c(NA, NA)
+  )
+  tibble(Predictor = pred_names[i], Estimate = boot_out$t0[i],
+         Lower95 = ci[1], Upper95 = ci[2])
+})
+
+boot_ci_df %>%
+  mutate(Predictor = fct_reorder(Predictor, Estimate)) %>%
+  ggplot(aes(x = Estimate, y = Predictor)) +
+  geom_col(fill = "steelblue", alpha = 0.8) +
+  geom_errorbar(aes(xmin = Lower95, xmax = Upper95), width = 0.3, color = "black") +
+  labs(x = "Average Absolute Coefficient (95 percent Bootstrap CI)", y = NULL) +
+  theme_minimal(base_size = 11)
+```
+
+WAB is clearly the most influential predictor in the model, with an average absolute coefficient of 20.0. That’s noticeably larger than Barthag (14.7), and way above the efficiency metrics (3.3 for adjusted offense, 2.9 for adjusted defense) and strength of schedule (0.5). The bootstrap confidence intervals back this up. WAB’s interval (18.4, 26.3) doesn’t overlap with the efficiency metrics at all, and even though Barthag’s interval (7.8, 50.8) is wide, it still sits well above the efficiency variables.
+
+That wide interval for Barthag is actually expected because it reflects some instability in how the model splits credit between Barthag and WAB across different resamples, since they’re pretty correlated. But even with that, both consistently matter much more than the pure efficiency metrics.
+
+Overall, this points to a pretty clear takeaway: the committee seems to care more about what a team actually did against its schedule (WAB) than how “good” it looks in efficiency terms. Strength of schedule doesn’t add much once WAB is in the model, which makes sense since WAB already builds that in.
+
+The combined model explains about 86.3% of teams within two seed lines, leaving roughly 14% of cases where the committee deviates from what the metrics would predict. Those gaps in which those teams are seeded noticeably higher or lower than expected are what the rest of our project focuses on, including things like conference tournament effects, conference-level bias, and changes after the introduction of NET rankings in 2019.
