@@ -136,11 +136,17 @@ My part of the project asks a pretty specific question: did the selection commit
 
 This setup is also the one that best matches the project context file and the rubric. The context markdown says my section should use a course-supported method, compare models, and quantify uncertainty for the specific NET-era question. It also recommends multinomial logistic regression as the safest choice because that method was explicitly covered in class, while ordinal regression was not clearly documented in the course materials.
 
+### Model
+
 To look at that, I treat each seeded team-season as one observation and model final NCAA seed as a categorical outcome. I use multinomial logistic regression because seed is a 16-category response and that method lines up with the course material on multinomial models, held-out evaluation, and uncertainty-aware interpretation. The predictors I keep in the model are Barthag, adjusted offensive efficiency, adjusted defensive efficiency, adjusted tempo, Wins Above Bubble, current non-conference strength of schedule, and current overall strength of schedule. Table 2 gives a plain-English definition for each one. I standardize those variables first so the coefficient sizes are easier to compare on the same scale.
 
 I fit four versions of the model. The first is a pooled model with the main predictors and a `post_net` indicator. The second is the full interaction model, which adds a post-2019 interaction for every predictor. The third is a simpler targeted interaction model that only lets the three most plausible metrics move across eras: Barthag, Wins Above Bubble, and overall strength of schedule. The last step is a pair of separate era-specific models, one fit on the pre-2019 seasons and one fit on the post-2019 seasons, just to check whether the interaction results line up with the side-by-side coefficient patterns.
 
+### Assumptions
+
 This is still an observational model, so I am not treating any of these effects as causal. I am just asking whether the committee's seeding behavior appears to line up differently with public metrics before and after the NET era. I also assume the 2019 split is a reasonable way to mark the start of that change, even though the real transition in committee behavior could have been less clean than a single cutoff. Those assumptions are consistent with the project context file, which frames this section as a question about changes in committee weighting rather than a causal claim about why those changes happened.
+
+### Evaluation and Uncertainty
 
 For evaluation, I use a held-out test split and compare models with multiclass log-loss first, then exact seed accuracy and within-one-seed accuracy as secondary summaries. I also repeat the train/test split several times as a stability check, since one split can be noisy with only a few post-NET seasons. That follows the course emphasis on out-of-sample model comparison and also matches the rubric guidance in the context file, which says not to rely on raw accuracy alone. For uncertainty, I report approximate 95% intervals for the interaction terms. That is important because the rubric explicitly requires uncertainty quantification, and the real question here is not whether one model can classify seeds a little better, but whether there is enough evidence to say some metrics became more or less tied to seeding after NET.
 
