@@ -1,0 +1,226 @@
+---
+title: "NCAA Tournament Seeding: Conference Tournament Seed Boost"
+author: "Sam Sclaver"
+date: "2026-04-25"
+output:
+  pdf_document:
+    toc: false
+header-includes:
+  - \usepackage{float}
+  - \floatplacement{figure}{H}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+library(cbbdata)
+library(tidyverse)
+library(nnet)
+library(brms)
+library(knitr)
+library(kableExtra)
+
+cbd_login(username = "sclaversam96", password = "$NBA2k9696")
+```
+
+```{r pull-ratings}
+ratings <- cbd_torvik_ratings() |>
+  as_tibble() |>
+  filter(!is.na(seed), seed >= 1, seed <= 16, year != 2020) |>
+  mutate(year = as.integer(year))
+```
+
+```{r pull-conf-tourney-wins}
+all_years <- ratings |> distinct(year) |> pull()
+
+conf_t_wins <- map_dfr(all_years, function(y) {
+  games <- cbd_torvik_game_stats(year = y)
+  games |>
+    filter(type == "conf_t", result == "W") |>
+    count(team) |>
+    mutate(year = as.integer(y))
+}) |>
+  rename(conf_t_wins = n)
+```
+
+```{r identify-conf-champs}
+conf_champs <- map_dfr(all_years, function(y) {
+  games <- cbd_torvik_game_stats(year = y)
+  games |>
+    filter(type == "conf_t") |>
+    arrange(team, date) |>
+    group_by(team) |>
+    summarize(last_result = last(result), .groups = "drop") |>
+    filter(last_result == "W") |>
+    mutate(conf_champ = 1, year = as.integer(y))
+}) |>
+  select(team, year, conf_champ)
+```
+
+```{r build-dataset}
+model_data <- ratings |>
+  select(team, year, conf, seed, barthag, wab, adj_o, adj_d,
+         adj_t, nc_elite_sos) |>
+  left_join(conf_t_wins, by = c("team", "year")) |>
+  mutate(conf_t_wins = replace_na(conf_t_wins, 0)) |>
+  left_join(conf_champs, by = c("team", "year")) |>
+  mutate(conf_champ = replace_na(conf_champ, 0)) |>
+  mutate(seed_factor = factor(seed, levels = 1:16)) |>
+  drop_na()
+```
+
+```{r define-tiers}
+tier_justification <- model_data |>
+  group_by(conf) |>
+  summarize(
+    total_teams = n(),
+    at_large = sum(conf_champ == 0),
+    auto_bid = sum(conf_champ == 1),
+    at_large_pct = round(at_large / total_teams, 2),
+    .groups = "drop"
+  ) |>
+  arrange(desc(at_large_pct))
+
+power <- c("ACC", "B10", "B12", "SEC", "BE", "P10", "P12")
+mid <- c("A10", "MWC", "Amer", "WCC")
+
+model_data <- model_data |>
+  mutate(
+    conf_tier = case_when(
+      conf %in% power ~ "Power",
+      conf %in% mid ~ "Mid",
+      TRUE ~ "Low"
+    ),
+    conf_tier = factor(conf_tier, levels = c("Power", "Mid", "Low"))
+  )
+```
+
+```{r baseline-model}
+model_data <- model_data |>
+  mutate(across(c(barthag, wab, adj_o, adj_d, nc_elite_sos),
+                ~ scale(.)[, 1],
+                .names = "{.col}_z"))
+
+baseline_m3 <- multinom(
+  seed_factor ~ adj_o_z + adj_d_z + barthag_z + wab_z + nc_elite_sos_z,
+  data = model_data, MaxNWts = 10000, maxit = 500, trace = FALSE
+)
+```
+
+```{r get-residuals}
+pred_seed_fn <- function(model, newdata) {
+  probs <- predict(model, newdata = newdata, type = "probs")
+  apply(probs, 1, function(row) as.integer(names(which.max(row))))
+}
+
+model_data <- model_data |>
+  mutate(
+    pred_seed = pred_seed_fn(baseline_m3, model_data),
+    seed_residual = seed - pred_seed
+  )
+```
+
+## Sam Sclaver: Conference Tournament Seed Boost
+
+### Methods
+
+The goal of this analysis is to determine whether conference tournament performance provides a systematic seed boost beyond what a team's regular season metrics already predict, and whether this effect varies by conference tier. The outcome variable is the seed residual from the baseline multinomial model (actual seed minus predicted seed), where a positive residual indicates the committee seeded the team worse than predicted and a negative residual indicates the committee was more generous than expected.
+
+The key predictor is the number of conference tournament wins a team accumulated, derived from game-level data in cbbdata by filtering to conference tournament games and counting wins per team per season. To examine whether the per-win effect differs across conference strength, I classified conferences into three tiers based on historical at-large bid rates from 2008 to 2024. At-large bids are awarded to teams that did not win their conference tournament but are deemed worthy by the committee, so a conference's at-large rate reflects how consistently its teams are viewed as tournament-caliber beyond just the automatic bid winner. Power conferences (ACC, Big Ten, Big 12, SEC, Big East, Pac-10/12) have at-large rates above 75\%, mid-major conferences (A-10, Mountain West, AAC, WCC) range from 48 to 68\%, and low-major conferences have at-large rates below 20\%. The Ivy League is classified as low-major despite a 47\% at-large rate because this reflects only `r model_data |> filter(conf == "Ivy") |> nrow()` total tournament appearances and `r model_data |> filter(conf == "Ivy", conf_champ == 0) |> nrow()` at-large bids across 17 seasons, both well below any conference classified as mid-major.
+
+The primary model is a Bayesian hierarchical model fit using \texttt{brms}:
+
+$$\text{seed\_residual}_i = \beta_0 + \beta_1 \cdot \text{conf\_t\_wins}_i + u_{0,j} + u_{1,j} \cdot \text{conf\_t\_wins}_i + \epsilon_i$$
+
+$$u_{0,j}, u_{1,j} \sim \text{MVN}(0, \Sigma), \quad \epsilon_i \sim \text{Normal}(0, \sigma^2)$$
+
+where $j$ indexes conference tier and $u_{0,j}$ and $u_{1,j}$ are tier-level random intercepts and slopes with partial pooling. Priors are weakly informative: $\text{Normal}(0, 3)$ on fixed effects and $\text{Exponential}(1)$ on standard deviation parameters. The model was fit with 4 chains and 4000 iterations per chain. Partial pooling is appropriate because the per-win effect likely varies across tiers but each tier has limited data, and independent estimation would produce noisy estimates. As a comparison, I fit a simple linear regression without tier structure and a frequentist interaction model with conference tournament wins interacted with tier. Model fit is validated through posterior predictive checks.
+
+
+```{r eda-plot, fig.height=3.5, fig.cap="Average seed residual by conference tournament wins, faceted by conference tier. A positive residual indicates the committee seeded the team worse than the baseline model predicted. Error bars represent 95 percent confidence intervals. Groups with fewer than 10 observations are excluded."}
+model_data |>
+  filter(conf_t_wins <= 4) |>
+  group_by(conf_tier, conf_t_wins) |>
+  summarize(
+    n = n(),
+    avg_residual = mean(seed_residual),
+    se = sd(seed_residual) / sqrt(n()),
+    .groups = "drop"
+  ) |>
+  filter(n >= 10) |>
+  ggplot(aes(x = conf_t_wins, y = avg_residual)) +
+  geom_point(size = 3, color = "steelblue") +
+  geom_line(color = "steelblue") +
+  geom_errorbar(aes(ymin = avg_residual - 1.96 * se,
+                     ymax = avg_residual + 1.96 * se),
+                width = 0.2, color = "steelblue") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  facet_wrap(~conf_tier) +
+  labs(x = "Conference Tournament Wins", y = "Average Seed Residual",
+       title = "Average Seed Deviation by Conference Tournament Wins") +
+  theme_minimal()
+```
+
+### Results
+
+```{r bayes-model, cache=TRUE, results='hide', message=FALSE}
+bayes_model <- brm(
+  seed_residual ~ conf_t_wins + (1 + conf_t_wins | conf_tier),
+  data = model_data,
+  family = gaussian(),
+  prior = c(
+    prior(normal(0, 3), class = b),
+    prior(normal(0, 3), class = Intercept),
+    prior(exponential(1), class = sd),
+    prior(exponential(1), class = sigma)
+  ),
+  chains = 4,
+  iter = 4000,
+  warmup = 2000,
+  seed = 36460,
+  cores = 4
+)
+```
+
+```{r comparison-models}
+simple_model <- lm(seed_residual ~ conf_t_wins, data = model_data)
+interaction_model <- lm(seed_residual ~ conf_t_wins * conf_tier, data = model_data)
+```
+
+
+```{r tier-slopes, fig.height=3.5, fig.cap="Estimated per-win seed boost by conference tier with 95 percent credible intervals. All three tiers have intervals crossing zero, indicating no credible per-win effect in any tier."}
+tier_effects <- ranef(bayes_model)$conf_tier[, , "conf_t_wins"]
+fixed_slope <- fixef(bayes_model)["conf_t_wins", "Estimate"]
+
+tier_slopes <- tibble(
+  conf_tier = rownames(tier_effects),
+  total_slope = fixed_slope + tier_effects[, "Estimate"],
+  lower = fixed_slope + tier_effects[, "Q2.5"],
+  upper = fixed_slope + tier_effects[, "Q97.5"]
+) |>
+  mutate(conf_tier = factor(conf_tier, levels = c("Power", "Mid", "Low")))
+
+ggplot(tier_slopes, aes(x = conf_tier, y = total_slope)) +
+  geom_point(size = 3, color = "steelblue") +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.2, color = "steelblue") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(x = "Conference Tier", y = "Per-Win Effect on Seed Residual",
+       title = "Estimated Per-Win Seed Boost by Conference Tier",
+       subtitle = "95% Credible Intervals") +
+  theme_minimal()
+```
+
+```{r pp-check, fig.height=3.5, fig.cap="Posterior predictive check comparing observed seed residuals (dark line) to 100 simulated datasets from the posterior (light lines). The model captures the overall spread but does not replicate the discrete integer structure of the observed residuals."}
+pp_check(bayes_model, ndraws = 100) +
+  labs(title = "Posterior Predictive Check") +
+  theme_minimal()
+```
+
+
+
+Exploratory analysis reveals no clear pattern suggesting conference tournament wins improve seeding (Figure 1). In power conferences, teams with zero wins have the most negative residuals, with residuals increasing as wins accumulate. Mid-major conferences show a similar pattern with wider uncertainty, while low-major conferences trend slightly negative as wins increase.
+
+The Bayesian model estimates an overall per-win effect of `r round(fixef(bayes_model)["conf_t_wins", "Estimate"], 3)` seed lines (95\% credible interval: [`r round(fixef(bayes_model)["conf_t_wins", "Q2.5"], 3)`, `r round(fixef(bayes_model)["conf_t_wins", "Q97.5"], 3)`]), with the credible interval comfortably containing zero, indicating no strong evidence of a systematic per-win effect. Tier-specific slopes are `r round(fixef(bayes_model)["conf_t_wins", "Estimate"] + ranef(bayes_model)$conf_tier[, , "conf_t_wins"]["Power", "Estimate"], 3)` for power, `r round(fixef(bayes_model)["conf_t_wins", "Estimate"] + ranef(bayes_model)$conf_tier[, , "conf_t_wins"]["Mid", "Estimate"], 3)` for mid-major, and `r round(fixef(bayes_model)["conf_t_wins", "Estimate"] + ranef(bayes_model)$conf_tier[, , "conf_t_wins"]["Low", "Estimate"], 3)` for low-major (Figure 2), with all three credible intervals crossing zero. The low-major negative slope is expected: these teams almost exclusively reach the tournament by winning their conference tournament, so their wins are not new information to the committee but a prerequisite for being in the field.
+
+The simple linear regression estimates a per-win effect of `r round(coef(simple_model)["conf_t_wins"], 3)` ($p < 0.001$), but the interaction model reveals this differs by tier, with low-major conferences showing a significant negative interaction (estimate = `r round(coef(interaction_model)["conf_t_wins:conf_tierLow"], 3)`, $p$ < 0.001). The Bayesian model, through partial pooling, appropriately shrinks all estimates toward zero, reflecting the genuine uncertainty. Posterior predictive checks (Figure 3) confirm the model captures the overall spread of residuals, though it does not replicate the discrete integer structure of the observed data. The overall model explains only `r round(summary(interaction_model)$r.squared * 100, 1)`\% of variance in seed residuals.
+
+The central finding is that the NCAA selection committee does not appear to systematically reward or penalize conference tournament performance beyond what regular season metrics already capture. While conference tournament results are known to be one of many factors the committee considers, this analysis suggests their influence on seeding is minimal once team quality is controlled for.
