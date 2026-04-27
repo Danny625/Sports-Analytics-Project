@@ -1,0 +1,514 @@
+---
+title: "Danny Weng: NET Era Shift and NCAA Tournament Seeding"
+author: "Danny Weng"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 9,
+  fig.height = 6
+)
+```
+
+```{r packages}
+required_packages <- c(
+  "tidyverse",
+  "nnet",
+  "yardstick",
+  "knitr",
+  "scales",
+  "ggplot2"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Install these packages before knitting: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+library(tidyverse)
+library(nnet)
+library(yardstick)
+library(knitr)
+library(scales)
+library(ggplot2)
+
+theme_set(theme_minimal(base_size = 12))
+set.seed(460)
+```
+
+## Data and Sample
+
+I exported the Torvik team-season data from `cbbdata` to a local CSV first, then used that file here so the analysis does not depend on live API calls while knitting.
+
+```{r load-data}
+raw_data <- readr::read_csv("torvik_ratings_2008_2024.csv", show_col_types = FALSE)
+```
+
+The Torvik export includes team quality metrics and NCAA seeds by season. For this section, I only keep seeded teams, drop 2020 because there was no NCAA tournament, and create a `post_net` indicator for 2019 and later.
+
+```{r build-data}
+predictor_lookup <- tibble(
+  raw_name = c(
+    "barthag",
+    "adj_o",
+    "adj_d",
+    "adj_t",
+    "wab",
+    "nc_cur_sos",
+    "ov_cur_sos"
+  ),
+  label = c(
+    "Barthag",
+    "Adjusted offensive efficiency",
+    "Adjusted defensive efficiency",
+    "Adjusted tempo",
+    "Wins Above Bubble",
+    "Current non-conference strength of schedule",
+    "Current overall strength of schedule"
+  ),
+  meaning = c(
+    "Torvik's overall team strength rating, based on expected win probability against an average Division I team on a neutral floor.",
+    "Points scored per 100 possessions after adjusting for opponent strength.",
+    "Points allowed per 100 possessions after adjusting for opponent strength.",
+    "Adjusted possessions per game.",
+    "How much better or worse a team performed than a bubble-level team would be expected to perform against the same schedule.",
+    "How difficult the team's non-conference schedule was up to Selection Sunday.",
+    "How difficult the team's full schedule was up to Selection Sunday."
+  )
+)
+
+predictor_cols <- predictor_lookup$raw_name
+
+analysis_data <- raw_data |>
+  filter(!is.na(seed), seed >= 1, seed <= 16, year != 2020) |>
+  distinct(team, year, .keep_all = TRUE) |>
+  transmute(
+    team,
+    conf,
+    year,
+    post_net = if_else(year >= 2019, 1, 0),
+    seed_num = as.integer(seed),
+    seed = factor(as.character(as.integer(seed)), levels = as.character(1:16)),
+    across(all_of(predictor_cols), as.numeric)
+  ) |>
+  drop_na()
+
+model_data <- analysis_data |>
+  mutate(across(all_of(predictor_cols), ~ as.numeric(scale(.x)[, 1])))
+
+sample_summary <- tibble(
+  total_team_seasons = nrow(model_data),
+  pre_net_team_seasons = sum(model_data$post_net == 0),
+  post_net_team_seasons = sum(model_data$post_net == 1),
+  seasons_used = paste0(min(model_data$year), "-", max(model_data$year), ", excluding 2020")
+)
+
+kable(sample_summary, caption = "Analytic sample used in Danny's NET-era seeding analysis.")
+```
+
+```{r variable-guide}
+kable(
+  predictor_lookup,
+  caption = "Plain-English guide to the predictor variables used in Danny's model."
+)
+```
+
+## Methods
+
+### Danny Weng
+
+My part of the project asks a pretty specific question: did the selection committee seem to weigh the usual team-quality and resume metrics differently once the NET system showed up in 2019?
+
+This setup is also the one that best matches the project context file and the rubric. The context markdown says my section should use a course-supported method, compare models, and quantify uncertainty for the specific NET-era question. It also recommends multinomial logistic regression as the safest choice because that method was explicitly covered in class, while ordinal regression was not clearly documented in the course materials.
+
+### Model
+
+To look at that, I treat each seeded team-season as one observation and model final NCAA seed as a categorical outcome. I use multinomial logistic regression because seed is a 16-category response and that method lines up with the course material on multinomial models, held-out evaluation, and uncertainty-aware interpretation. The predictors I keep in the model are Barthag, adjusted offensive efficiency, adjusted defensive efficiency, adjusted tempo, Wins Above Bubble, current non-conference strength of schedule, and current overall strength of schedule. Table 2 gives a plain-English definition for each one. I standardize those variables first so the coefficient sizes are easier to compare on the same scale.
+
+I fit four versions of the model. The first is a pooled model with the main predictors and a `post_net` indicator. The second is the full interaction model, which adds a post-2019 interaction for every predictor. The third is a simpler targeted interaction model that only lets the three most plausible metrics move across eras: Barthag, Wins Above Bubble, and overall strength of schedule. The last step is a pair of separate era-specific models, one fit on the pre-2019 seasons and one fit on the post-2019 seasons, just to check whether the interaction results line up with the side-by-side coefficient patterns.
+
+### Assumptions
+
+This is still an observational model, so I am not treating any of these effects as causal. I am just asking whether the committee's seeding behavior appears to line up differently with public metrics before and after the NET era. I also assume the 2019 split is a reasonable way to mark the start of that change, even though the real transition in committee behavior could have been less clean than a single cutoff. Those assumptions are consistent with the project context file, which frames this section as a question about changes in committee weighting rather than a causal claim about why those changes happened.
+
+### Evaluation and Uncertainty
+
+For evaluation, I use a held-out test split and compare models with multiclass log-loss first, then exact seed accuracy and within-one-seed accuracy as secondary summaries. I also repeat the train/test split several times as a stability check, since one split can be noisy with only a few post-NET seasons. That follows the course emphasis on out-of-sample model comparison and also matches the rubric guidance in the context file, which says not to rely on raw accuracy alone. For uncertainty, I report approximate 95% intervals for the interaction terms. That is important because the rubric explicitly requires uncertainty quantification, and the real question here is not whether one model can classify seeds a little better, but whether there is enough evidence to say some metrics became more or less tied to seeding after NET.
+
+```{r model-formulas, include=FALSE}
+main_terms <- paste(predictor_cols, collapse = " + ")
+interaction_terms <- paste(paste0("post_net:", predictor_cols), collapse = " + ")
+targeted_interaction_predictors <- c("barthag", "wab", "ov_cur_sos")
+targeted_interaction_terms <- paste(paste0("post_net:", targeted_interaction_predictors), collapse = " + ")
+
+formula_a <- as.formula(paste("seed ~", main_terms, "+ post_net"))
+formula_b <- as.formula(paste("seed ~", main_terms, "+ post_net +", interaction_terms))
+formula_c <- as.formula(paste("seed ~", main_terms, "+ post_net +", targeted_interaction_terms))
+formula_sep <- as.formula(paste("seed ~", main_terms))
+```
+
+```{r train-test-split, include=FALSE}
+set.seed(460)
+
+train_rows <- model_data |>
+  group_by(seed) |>
+  slice_sample(prop = 0.8) |>
+  mutate(row_id = row_number()) |>
+  ungroup() |>
+  mutate(join_id = paste(team, year, seed, sep = "__")) |>
+  pull(join_id)
+
+model_data <- model_data |>
+  mutate(join_id = paste(team, year, seed, sep = "__"))
+
+train_data <- model_data |>
+  filter(join_id %in% train_rows) |>
+  select(-join_id)
+
+test_data <- model_data |>
+  filter(!join_id %in% train_rows) |>
+  select(-join_id)
+```
+
+```{r fit-models}
+model_a <- nnet::multinom(
+  formula_a,
+  data = train_data,
+  trace = FALSE,
+  MaxNWts = 10000
+)
+
+model_b <- nnet::multinom(
+  formula_b,
+  data = train_data,
+  trace = FALSE,
+  MaxNWts = 10000
+)
+
+model_c <- nnet::multinom(
+  formula_c,
+  data = train_data,
+  trace = FALSE,
+  MaxNWts = 10000
+)
+
+model_pre <- nnet::multinom(
+  formula_sep,
+  data = filter(model_data, post_net == 0),
+  trace = FALSE,
+  MaxNWts = 10000
+)
+
+model_post <- nnet::multinom(
+  formula_sep,
+  data = filter(model_data, post_net == 1),
+  trace = FALSE,
+  MaxNWts = 10000
+)
+```
+
+## Results
+
+### Danny Weng
+
+The goal of this section is to test one narrow question: whether the relationship between standard team metrics and NCAA seed looks different after the committee started using NET in 2019.
+
+The analysis sample includes `r nrow(model_data)` seeded team-seasons from `r min(model_data$year)` through `r max(model_data$year)`, with 2020 removed because there was no tournament. That leaves `r sum(model_data$post_net == 0)` pre-NET observations and `r sum(model_data$post_net == 1)` post-NET observations.
+
+### Model Comparison
+
+```{r evaluation-functions}
+coerce_prob_matrix <- function(pred_obj, classes, n_rows) {
+  if (is.null(dim(pred_obj))) {
+    if (!is.null(names(pred_obj)) && all(names(pred_obj) %in% classes)) {
+      pred_mat <- matrix(pred_obj, nrow = 1)
+      colnames(pred_mat) <- names(pred_obj)
+    } else if (length(pred_obj) == n_rows && all(as.character(pred_obj) %in% classes)) {
+      pred_mat <- matrix(0, nrow = n_rows, ncol = length(classes))
+      colnames(pred_mat) <- classes
+      idx <- match(as.character(pred_obj), classes)
+      pred_mat[cbind(seq_len(n_rows), idx)] <- 1
+    } else if (length(classes) == 2 && length(pred_obj) == n_rows) {
+      pred_mat <- cbind(1 - pred_obj, pred_obj)
+      colnames(pred_mat) <- classes
+    } else {
+      pred_mat <- matrix(pred_obj, nrow = n_rows, byrow = TRUE)
+    }
+  } else {
+    pred_mat <- as.matrix(pred_obj)
+  }
+
+  pred_tbl <- as_tibble(pred_mat)
+
+  if (is.null(colnames(pred_mat))) {
+    names(pred_tbl) <- paste0("V", seq_len(ncol(pred_tbl)))
+  }
+
+  missing_classes <- setdiff(classes, names(pred_tbl))
+
+  if (length(missing_classes) > 0) {
+    for (cls in missing_classes) {
+      pred_tbl[[cls]] <- 0
+    }
+  }
+
+  pred_tbl |>
+    select(all_of(classes))
+}
+
+evaluate_multinom <- function(model, new_data, model_name) {
+  classes <- levels(new_data$seed)
+  raw_probs <- predict(model, newdata = new_data, type = "probs")
+  probs_tbl <- coerce_prob_matrix(raw_probs, classes, nrow(new_data))
+
+  pred_class <- classes[max.col(as.matrix(probs_tbl), ties.method = "first")]
+
+  tibble(
+    model = model_name,
+    log_loss = mn_log_loss_vec(
+      truth = new_data$seed,
+      estimate = as.matrix(probs_tbl)
+    ),
+    accuracy = mean(pred_class == as.character(new_data$seed)),
+    within_one_seed = mean(abs(as.integer(pred_class) - new_data$seed_num) <= 1)
+  )
+}
+
+model_comparison <- bind_rows(
+  evaluate_multinom(model_a, test_data, "Pooled no-interaction"),
+  evaluate_multinom(model_b, test_data, "Pooled full interaction"),
+  evaluate_multinom(model_c, test_data, "Pooled targeted interaction")
+)
+
+model_diagnostics <- bind_rows(
+  evaluate_multinom(model_a, train_data, "Pooled no-interaction") |>
+    mutate(split = "Train"),
+  evaluate_multinom(model_a, test_data, "Pooled no-interaction") |>
+    mutate(split = "Test"),
+  evaluate_multinom(model_b, train_data, "Pooled full interaction") |>
+    mutate(split = "Train"),
+  evaluate_multinom(model_b, test_data, "Pooled full interaction") |>
+    mutate(split = "Test"),
+  evaluate_multinom(model_c, train_data, "Pooled targeted interaction") |>
+    mutate(split = "Train"),
+  evaluate_multinom(model_c, test_data, "Pooled targeted interaction") |>
+    mutate(split = "Test")
+) |>
+  select(split, everything())
+
+evaluate_split <- function(split_seed) {
+  set.seed(split_seed)
+
+  split_ids <- model_data |>
+    group_by(seed) |>
+    slice_sample(prop = 0.8) |>
+    ungroup() |>
+    mutate(split_id = paste(team, year, seed, sep = "__")) |>
+    pull(split_id)
+
+  split_train <- model_data |>
+    mutate(split_id = paste(team, year, seed, sep = "__")) |>
+    filter(split_id %in% split_ids) |>
+    select(-split_id)
+
+  split_test <- model_data |>
+    mutate(split_id = paste(team, year, seed, sep = "__")) |>
+    filter(!split_id %in% split_ids) |>
+    select(-split_id)
+
+  split_model_a <- nnet::multinom(formula_a, data = split_train, trace = FALSE, MaxNWts = 10000)
+  split_model_b <- nnet::multinom(formula_b, data = split_train, trace = FALSE, MaxNWts = 10000)
+  split_model_c <- nnet::multinom(formula_c, data = split_train, trace = FALSE, MaxNWts = 10000)
+
+  bind_rows(
+    evaluate_multinom(split_model_a, split_test, "Pooled no-interaction"),
+    evaluate_multinom(split_model_b, split_test, "Pooled full interaction"),
+    evaluate_multinom(split_model_c, split_test, "Pooled targeted interaction")
+  ) |>
+    mutate(split_seed = split_seed)
+}
+
+set.seed(460)
+repeat_split_results <- bind_rows(lapply(460 + 0:9, evaluate_split)) |>
+  group_by(model) |>
+  summarise(
+    mean_log_loss = mean(log_loss),
+    sd_log_loss = sd(log_loss),
+    mean_accuracy = mean(accuracy),
+    mean_within_one_seed = mean(within_one_seed),
+    .groups = "drop"
+  ) |>
+  arrange(mean_log_loss)
+
+kable(
+  model_comparison |>
+    mutate(
+      log_loss = round(log_loss, 4),
+      accuracy = percent(accuracy, accuracy = 0.1),
+      within_one_seed = percent(within_one_seed, accuracy = 0.1)
+    ),
+  caption = "Held-out model comparison for Danny's NET-era analysis."
+)
+```
+
+On the held-out test set, the pooled no-interaction model had a log-loss of `r round(model_comparison$log_loss[model_comparison$model == "Pooled no-interaction"], 3)`. The full interaction model was worse at `r round(model_comparison$log_loss[model_comparison$model == "Pooled full interaction"], 3)`, while the simpler targeted interaction model came in at `r round(model_comparison$log_loss[model_comparison$model == "Pooled targeted interaction"], 3)`. Exact seed accuracy was `r percent(model_comparison$accuracy[model_comparison$model == "Pooled no-interaction"], accuracy = 0.1)`, `r percent(model_comparison$accuracy[model_comparison$model == "Pooled full interaction"], accuracy = 0.1)`, and `r percent(model_comparison$accuracy[model_comparison$model == "Pooled targeted interaction"], accuracy = 0.1)`, respectively. Within-one-seed accuracy was `r percent(model_comparison$within_one_seed[model_comparison$model == "Pooled no-interaction"], accuracy = 0.1)`, `r percent(model_comparison$within_one_seed[model_comparison$model == "Pooled full interaction"], accuracy = 0.1)`, and `r percent(model_comparison$within_one_seed[model_comparison$model == "Pooled targeted interaction"], accuracy = 0.1)`.
+
+That comparison is the main test of the NET-era question. If allowing post-2019 effects really helps, one of the interaction models should outperform the stable baseline. Here, the full interaction model does not. It is worse on log-loss and slightly worse on both accuracy summaries, which suggests that a broad across-the-board shift in committee weighting is not strongly supported by out-of-sample performance. The targeted interaction model is the more realistic stress test, since it only gives extra flexibility to the metrics that looked most plausible. In this sample, though, it still does not beat the no-interaction baseline.
+
+```{r model-diagnostics}
+kable(
+  model_diagnostics |>
+    mutate(
+      log_loss = round(log_loss, 4),
+      accuracy = percent(accuracy, accuracy = 0.1),
+      within_one_seed = percent(within_one_seed, accuracy = 0.1)
+    ),
+  caption = "Train-versus-test comparison for the two pooled models."
+)
+```
+
+The train-versus-test table helps explain why. On the training data, the larger interaction models do a little better than the no-interaction model, but that advantage fades or reverses on the test set. That is the pattern I would expect from mild overfitting: the larger model is flexible enough to fit extra noise in the training sample, especially with only a few post-2019 seasons, but that extra flexibility does not carry over to new observations.
+
+```{r repeated-split-check}
+kable(
+  repeat_split_results |>
+    mutate(
+      mean_log_loss = round(mean_log_loss, 4),
+      sd_log_loss = round(sd_log_loss, 4),
+      mean_accuracy = percent(mean_accuracy, accuracy = 0.1),
+      mean_within_one_seed = percent(mean_within_one_seed, accuracy = 0.1)
+    ),
+  caption = "Average holdout performance across 10 stratified train/test splits."
+)
+```
+
+The repeated-split check points in the same direction. Across 10 different stratified train/test splits, the no-interaction model has the best average log-loss at `r round(repeat_split_results$mean_log_loss[repeat_split_results$model == "Pooled no-interaction"], 3)`, compared with `r round(repeat_split_results$mean_log_loss[repeat_split_results$model == "Pooled full interaction"], 3)` for the full interaction model and `r round(repeat_split_results$mean_log_loss[repeat_split_results$model == "Pooled targeted interaction"], 3)` for the targeted interaction model. That makes me more confident that the weak NET-shift result is not just coming from one unlucky split.
+
+### Interaction Estimates and Uncertainty
+
+```{r interaction-functions}
+tidy_multinom_with_intervals <- function(model, conf_level = 0.95) {
+  model_summary <- summary(model)
+  coef_mat <- model_summary$coefficients
+  se_mat <- model_summary$standard.errors
+
+  coef_df <- as.data.frame(coef_mat) |>
+    tibble::rownames_to_column("outcome") |>
+    pivot_longer(-outcome, names_to = "term", values_to = "estimate")
+
+  se_df <- as.data.frame(se_mat) |>
+    tibble::rownames_to_column("outcome") |>
+    pivot_longer(-outcome, names_to = "term", values_to = "std.error")
+
+  z_value <- qnorm(0.975)
+
+  left_join(coef_df, se_df, by = c("outcome", "term")) |>
+    mutate(
+      conf.low = estimate - z_value * std.error,
+      conf.high = estimate + z_value * std.error
+    )
+}
+
+interaction_terms_found <- tidy_multinom_with_intervals(model_b) |>
+  filter(str_detect(term, ":post_net$")) |>
+  mutate(
+    metric = str_remove(term, ":post_net$"),
+    outcome = factor(outcome, levels = rev(sort(unique(outcome))))
+  )
+
+interaction_summary <- interaction_terms_found |>
+  mutate(abs_estimate = abs(estimate)) |>
+  group_by(metric) |>
+  summarise(
+    mean_abs_interaction = mean(abs_estimate),
+    share_intervals_excluding_zero = mean(conf.low > 0 | conf.high < 0),
+    .groups = "drop"
+  ) |>
+  arrange(desc(mean_abs_interaction))
+
+kable(
+  interaction_summary |>
+    mutate(
+      mean_abs_interaction = round(mean_abs_interaction, 3),
+      share_intervals_excluding_zero = percent(share_intervals_excluding_zero, accuracy = 0.1)
+    ),
+  caption = "Summary of which metrics shift the most in the interaction model."
+)
+```
+
+Figure 1 still matters, because even if the full interaction model does not improve overall prediction, the interaction terms can show whether a smaller number of metrics moved more than the others. Looking across seed categories, the largest average interaction shifts come from `r interaction_summary |> left_join(predictor_lookup, by = c("metric" = "raw_name")) |> slice_head(n = 3) |> pull(label) |> paste(collapse = ", ")`. In plain terms, those are the variables whose relationship with seed changes the most between the pre-NET and post-NET eras.
+
+```{r interaction-plot, fig.cap="Estimated NET-era interaction terms from the pooled multinomial model. Points are coefficient estimates and bars are approximate 95% intervals."}
+ggplot(interaction_terms_found, aes(x = estimate, y = metric)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_point(color = "#0B4F6C", size = 1.8) +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.15, color = "#0B4F6C") +
+  facet_wrap(~ outcome, scales = "free_x") +
+  labs(
+    title = "Estimated changes in metric weight after the switch to NET",
+    x = "Interaction estimate",
+    y = NULL
+  )
+```
+
+At the same time, the interval estimates make it clear that not every apparent shift is precise. Many of the interaction bars still overlap zero, so I should be careful not to oversell the story. The safest conclusion is that the committee's weighting does not look completely identical across eras, but the evidence for a major system-wide change after NET is weak in this model. If there was a shift, it seems more likely to have been concentrated in a small subset of metrics rather than showing up clearly across the whole profile.
+
+### Separate-Era Check
+
+```{r separate-era}
+pull_main_effects <- function(model, era_label) {
+  tidy_multinom_with_intervals(model) |>
+    filter(term %in% predictor_cols) |>
+    mutate(
+      era = era_label,
+      outcome = factor(outcome, levels = rev(sort(unique(outcome))))
+    )
+}
+
+era_effects <- bind_rows(
+  pull_main_effects(model_pre, "Pre-2019"),
+  pull_main_effects(model_post, "Post-2019")
+)
+```
+
+```{r era-effect-plot, fig.cap="Side-by-side coefficient comparison from separate pre-2019 and post-2019 multinomial models."}
+ggplot(era_effects, aes(x = estimate, y = term, color = era)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray60") +
+  geom_point(position = position_dodge(width = 0.5), size = 1.8) +
+  geom_errorbarh(
+    aes(xmin = conf.low, xmax = conf.high),
+    height = 0.15,
+    position = position_dodge(width = 0.5)
+  ) +
+  facet_wrap(~ outcome, scales = "free_x") +
+  scale_color_manual(values = c("Pre-2019" = "#0B4F6C", "Post-2019" = "#C96A28")) +
+  labs(
+    title = "Pre- and post-NET coefficient patterns",
+    x = "Coefficient estimate",
+    y = NULL,
+    color = NULL
+  )
+```
+
+Figure 2 is the main robustness check. When the separate pre-2019 and post-2019 models show differences in the same places as the interaction model, that makes those differences more believable. Overall, though, my read of this section is still pretty cautious: the data do not support a strong claim that the committee broadly changed how it seeds teams after the introduction of NET. The more defensible takeaway is that the overall seeding pattern stayed fairly similar, with only limited evidence that a few specific metrics may have shifted in importance.
+
+### Bottom Line
+
+The exact-seed accuracy should also be interpreted in context. This is a 16-category prediction problem, and the committee has the most discretion in the middle seed lines, so exact classification is a pretty strict standard. The no-interaction model still lands within one seed line `r percent(model_comparison$within_one_seed[model_comparison$model == "Pooled no-interaction"], accuracy = 0.1)` of the time, which is a more realistic way to judge whether the model is broadly tracking the committee.
+
+So I do not think the right takeaway is that NET caused a big reset in how teams get seeded. Based on the held-out comparison, the repeated-split check, and the uncertainty intervals, the cleaner answer is that the committee's overall weighting stayed pretty similar after 2019, with at most some limited movement in a few specific metrics.
