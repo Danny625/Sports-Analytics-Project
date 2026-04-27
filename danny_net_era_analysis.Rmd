@@ -451,7 +451,7 @@ kable(
 )
 ```
 
-Interaction Estimates and Uncertainty still matter, because even if the full interaction model does not improve overall prediction, the interaction terms can show whether a smaller number of metrics moved more than the others. Looking across seed categories, the largest average interaction shifts come from `r interaction_summary |> left_join(predictor_lookup, by = c("metric" = "raw_name")) |> slice_head(n = 3) |> pull(label) |> paste(collapse = ", ")`. In plain terms, those are the variables whose relationship with seed changes the most between the pre-NET and post-NET eras.
+Figure 1 still matters, because even if the full interaction model does not improve overall prediction, the interaction terms can show whether a smaller number of metrics moved more than the others. Looking across seed categories, the largest average interaction shifts come from `r interaction_summary |> left_join(predictor_lookup, by = c("metric" = "raw_name")) |> slice_head(n = 3) |> pull(label) |> paste(collapse = ", ")`. In plain terms, those are the variables whose relationship with seed changes the most between the pre-NET and post-NET eras.
 
 ```{r interaction-plot, fig.cap="Estimated NET-era interaction terms from the pooled multinomial model. Points are coefficient estimates and bars are approximate 95% intervals."}
 ggplot(interaction_terms_found, aes(x = estimate, y = metric)) +
