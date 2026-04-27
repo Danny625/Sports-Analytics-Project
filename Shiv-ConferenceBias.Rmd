@@ -1,0 +1,224 @@
+---
+title: "NCAA Tournament Seeding: Conference Bias"
+author: "Shiv Singhal"
+date: "2026-04-24"
+output:
+  pdf_document:
+    keep_tex: false
+    fig_caption: true
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{float}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE, 
+                      fig.align = "center", fig.width = 5, fig.height = 3)
+
+library(cbbdata)
+library(tidyverse)
+library(nnet)
+library(brms)
+library(tidybayes)
+library(posterior)
+library(knitr)
+library(kableExtra)
+library(boot)
+cbbdata::cbd_login(username = "shivsinghal", password = "shivs2005")
+
+set.seed(36460)
+```
+
+```{r data-and-baseline, include=FALSE}
+model_data <- cbd_torvik_ratings() %>%
+  as_tibble() %>%
+  filter(!is.na(seed), seed >= 1, seed <= 16) %>%
+  filter(year != 2020) %>%
+  drop_na() %>%
+  select(team, year, conf, seed, adj_o, adj_d, adj_em = adj_t, barthag, wab,
+         sos = nc_elite_sos) %>%
+  mutate(seed_factor = factor(seed, levels = 1:16),
+         year = as.integer(year),
+         conf = factor(conf)) %>%
+  mutate(across(c(adj_o, adj_d, adj_em, barthag, wab, sos),
+                ~ scale(.)[, 1],
+                .names = "{.col}_z"))
+
+baseline_m3_full <- multinom(seed_factor ~ adj_o_z + adj_d_z + barthag_z +
+                               wab_z + sos_z,
+                             data = model_data, MaxNWts = 10000, maxit = 500, 
+                             trace = FALSE)
+
+# Expected Seed Probability
+probs <- predict(baseline_m3_full, type = "probs")
+seed_levels <- as.numeric(colnames(probs))
+
+# >0 is under-seeded & <0 is over-seeded
+tourney <- model_data %>%
+  mutate(expected_seed = as.vector(probs %*% seed_levels),
+         seed_residual = seed - expected_seed)
+```
+
+# Shiv Singhal: Conference Bias
+
+## Methods
+
+The goal of this analysis is to figure out whether the selection committee systematically over-seeds or under-seeds certain conferences (when we control for team quality). The baseline model already explains ~86% of teams within two seed lines using only Barttorvik resume and efficiency metrics, so anything that conference affiliation adds would be coming from how the committee treats the conference itself, not how good the teams in it actually are.
+
+Our response variable is the **seed residual**, which is actual seed minus expected seed from the combined multinomial model (M3), where the expected seed is computed as $\sum_{k=1}^{16} k \cdot P(\text{seed}_i = k \mid x_i)$. A negative residual means the team was seeded better than its metrics warranted (over-seeded), and a positive residual means the team was given a seeded worse than its metrics warranted (under-seeded). Focusing on residuals lets us separate committee behavior from team performance. If a certrain conference's teams happen to have great metrics, the baseline captures that rather than the residual
+
+The main complication is sample size. Across 2008-2024 (excluding 2020), the major conferences (ACC, Big Ten, Big 12, SEC, Big East, Pac-12) contribute on the order of 90-120 tournament team-seasons each, while small one-bid conferences contribute fewer than 20. A simple per-conference mean residual would be wildly noisy for the small leagues and could easily produce a "biggest bias" estimate.
+
+### Primary Model: Bayesian Hierarchical Model with Conference Random Intercepts
+
+To account for the sample size issue, we fit a Bayesian hierarchical model with conference-level random intercepts:
+$$
+r_i = \beta_0 + \alpha_{c[i]} + \varepsilon_i, \qquad
+\alpha_c \sim \mathcal{N}(0, \tau^2), \qquad
+\varepsilon_i \sim \mathcal{N}(0, \sigma^2),
+$$
+where $r_i$ is the seed residual for team-season $i$, $c[i]$ is its conference, and $\alpha_c$ is the conference effect estimated with partial pooling. The priors are $\beta_0 \sim \mathcal{N}(0, 1)$, $\sigma \sim \text{Half-}\mathcal{N}(0, 2)$, and $\tau \sim \text{Half-}\mathcal{N}(0, 1)$. We chose to use Half-Normal distributions to ensure that the scale parameters are positive. As stated above, $\alpha_c > 0$ means conference $c$ is on average **under-seeded** and $\alpha_c < 0$ means conference $c$ is **over-seeded**. The full posterior on $\alpha_c$ is what we will use for point estimates and probabilities.
+
+### Model Choice & Assumptions
+
+Partial pooling is an effective method choice because conferences with only a handful of tournament teams have huge sampling variance in their raw mean residuals, and partial pooling shrinks those estimates toward the overall mean by an amount that depends on how much information the conference actually provides. That directly controls the false-positive rate as smaller conferences can't claim a large "bias" effect unless the data are very consistent.
+
+The model assumes residuals are approximately normal given the conference effect, residuals from different team-seasons within a conference are conditionally independent. The normality assumption is reasonable because the expected seed is computed as a weighted average over 16 categories, which smooths out the discreteness. We will confirm this assumption with posterior predictive checks on the residual distribution.
+
+### Comparison Plan
+
+We compare the hierarchical model against three simpler alternatives that all target individual conference mean residual, but handle pooling differently:
+
+1. **Complete Pooling**: a single intercept, $r_i = \beta_0 + \varepsilon_i$. This forces every conference effect to be zero and serves as a null benchmark.
+2. **No Pooling (Fixed Effects)**: $r_i = \beta_{c[i]} + \varepsilon_i$. This has a separate intercept for each conference and no shrinkage. 
+3. **Bootstrap of Individual Conference Mean Residuals**. For each conference, we resample its team-seasons with replacement $B = 2000$ times and compute a 95% percentile interval. This is a nonparametric residual-summary approach and confirms the parametric assumptions in the hierarchical model.
+
+We evaluate the hierarchical model against the no-pooling and complete-pooling versions using leave-one-out cross-validation (LOOCV) on the Bayesian fits, and against the bootstrap by visually overlaying intervals in the conference forest plot. The expectation is that LOOCV will prefer the hierarchical model if there is real cross-conference variation but not to the extent that no-pooling is justified, and that the hierarchical intervals will be tighter than bootstrap intervals for small conferences (because of shrinkage) but very similar for large ones.
+
+### Quantifying Uncertainty
+
+For the hierarchical model, uncertainty is fully captured by the posterior. For each conference, we report the posterior median and 95% credible interval for $\alpha_c$, and also the posterior probability that $\alpha_c > 0$ (under-seeded) and $\alpha_c < 0$ (over-seeded). We treat $P(\alpha_c > 0) > 0.95$ or $P(\alpha_c < 0) > 0.95$ as "credible evidence of bias" for that conference. We run 4 chains, 2,000 iterations each (1,000 as warmup), and check convergence with $\hat{R} < 1.01$ and bulk/tail effective sample sizes above 400.
+
+For the no-pooling and complete-pooling Bayesian models we report the same posterior summaries. For the bootstrap approach we report the percentile interval and the bootstrap-based proportion of resamples with mean residual greater than zero. We also run posterior predictive checks by simulating new residual datasets from the fitted hierarchical model and comparing the simulated distribution of residuals (overall and by conference) to the observed one.
+
+```{r fit-models, include=FALSE, cache=TRUE}
+# Hierarchical (Partial Pooling)
+m_hier <- brm(seed_residual ~ 1 + (1 | conf), data = tourney, 
+              family = gaussian,
+  prior = c(prior(normal(0, 1), class = "Intercept"),
+            prior(normal(0, 1), class = "sd"),
+            prior(normal(0, 2), class = "sigma")),
+  chains = 4, iter = 2000, warmup = 1000, cores = 4,
+  control = list(adapt_delta = 0.95), seed = 36460)
+
+# No Pooling (Fixed Effects for each Conference)
+m_nopool <- brm(seed_residual ~ 0 + conf, data = tourney, family = gaussian,
+  prior = c(prior(normal(0, 5), class = "b"),
+            prior(normal(0, 2), class = "sigma")),
+  chains = 4, iter = 2000, warmup = 1000, cores = 4, seed = 36460)
+
+# Complete Pooling (Null) 
+m_pool <- brm(seed_residual ~ 1, data = tourney, family = gaussian,
+  prior = c(prior(normal(0, 1), class = "Intercept"),
+            prior(normal(0, 2), class = "sigma")),
+  chains = 4, iter = 2000, warmup = 1000, cores = 4, seed = 36460)
+
+# Bootstrap Mean Residual for each Conference 
+boot_one <- function(d, i) mean(d$seed_residual[i])
+boot_results <- tourney |>
+  group_by(conf) |>
+  filter(n() >= 5) |> 
+  group_modify(~{b <- boot(.x, statistic = boot_one, R = 2000)
+  ci <- boot.ci(b, type = "perc")$percent[4:5]
+  tibble(mean_resid = mean(.x$seed_residual),
+         lower = ci[1], upper = ci[2], n = nrow(.x), 
+         p_over = mean(b$t > 0))}) |>
+  ungroup()
+
+# Leave-One-Out Comparison 
+loo_hier <- loo(m_hier)
+loo_nopool <- loo(m_nopool)
+loo_pool <- loo(m_pool)
+loo_compare_tab <- loo_compare(loo_hier, loo_nopool, loo_pool)
+```
+
+\newpage
+
+## Results
+
+```{r forest-plot, fig.cap="Posterior Conference Effects from the Bayesian Hierarchical Model. Conferences Ordered by Posterior Median. Sample Size $n$ is Number of Tournament Team-Seasons (2008--2024).", fig.height = 4.1}
+conf_post <- m_hier |>
+  spread_draws(r_conf[conf, term]) |>
+  median_qi(r_conf, .width = 0.95) |>
+  left_join(tourney |> count(conf), by = "conf") |>
+  mutate(conf = fct_reorder(conf, r_conf))
+
+conf_post |>
+  ggplot(aes(x = r_conf, y = conf, xmin = .lower, xmax = .upper)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  geom_pointrange(aes(color = .lower > 0 | .upper < 0), size = 0.3) +
+  scale_color_manual(values = c("FALSE" = "grey50", "TRUE" = "firebrick"),
+                     guide = "none") +
+  labs(x = expression("Conference Effect "*alpha[c]*" (Seed Lines)"), y = NULL,
+       title = "Conference-Level Seeding Bias (Partial Pooling)") +
+  theme_minimal(base_size = 10) +
+  theme(axis.text.y = element_text(angle = 30, hjust = 1, vjust = 0.5))
+```
+
+```{r posterior-probs, results='asis'}
+post_summary <- m_hier |>
+  spread_draws(r_conf[conf, term]) |>
+  group_by(conf) |>
+  summarise(median = median(r_conf),
+            lower = quantile(r_conf, 0.025),
+            upper = quantile(r_conf, 0.975),
+            p_pos = mean(r_conf > 0),
+            p_neg = mean(r_conf < 0)) |>
+  left_join(tourney |> count(conf), by = "conf") |>
+  arrange(desc(abs(median))) |>
+  slice_head(n = 8)
+
+post_summary |>
+  transmute(Conference = conf, n = n,
+            `Median (Seeds)` = sprintf("%+.2f", median),
+            `95% CrI` = sprintf("[%+.2f, %+.2f]", lower, upper),
+            `P(over)` = sprintf("%.2f", p_neg),
+            `P(under)` = sprintf("%.2f", p_pos)) |>
+  kable(caption = "Top 8 Conferences by Absolute Posterior Median Effect. P(over) and P(under) are the Probailities of Over-Seeding and Under-Seeding, Respectively.", booktabs = TRUE, align = "lccccc") |>
+  kable_styling(latex_options = "hold_position", font_size = 9)
+```
+
+Three conferences show credible bias. The SEC, Big East, and Big 12 are over-seeded by roughly half a seed line each, with posterior probabilities of over-seeding at 0.99 or above. A handful of smaller conferences (WAC, Ivy, MVC, ASun) lean toward being under-seeded by a similar magnitude, but their 95% credible intervals all include zero. The pattern hints that mid-majors get slightly less benefit of the doubt than their metrics would predict, but from this information we can't call any single conference credibly biased. Across the board, no effect exceeds 0.61 seed lines. The committee shows real bias, but at a magnitude unlikely to change a team's bracket region in any given year.
+
+```{r model-comparison, results='asis'}
+compare_tab <- conf_post |>
+  select(conf, hier_med = r_conf, hier_lo = .lower, hier_hi = .upper) |>
+  left_join(boot_results |> select(conf, boot_mean = mean_resid,
+                                   boot_lo = lower, boot_hi = upper, n),
+            by = "conf") |>
+  filter(!is.na(boot_mean)) |>
+  arrange(desc(abs(hier_med))) |>
+  slice_head(n = 6)
+
+compare_tab |>
+  transmute(Conference = conf, n = n,
+            `Hierarchical Median` = sprintf("%+.2f", hier_med),
+            `Hierarchical 95% CrI` = sprintf("[%+.2f, %+.2f]", hier_lo, hier_hi),
+            `Bootstrap Mean` = sprintf("%+.2f", boot_mean),
+            `Bootstrap 95% CI` = sprintf("[%+.2f, %+.2f]", boot_lo, boot_hi)) |>
+  kable(caption = "Hierarchical Posterior Intervals vs. Bootstrap Percentile Intervals for the Six Conferences with the Largest Absolute Hierarchical Effects.", booktabs = TRUE) |>
+  kable_styling(latex_options = "hold_position", font_size = 9)
+```
+
+The bootstrap comparison makes the value of partial pooling concrete. The SEC (n = 84) shows identical hierarchical and bootstrap intervals, meaning that at that sample size pooling does nothing. WAC and Ivy (n = 17 and n = 15) tell the opposite story as bootstrapping puts both around +1.0 seed lines, while the hierarchical model shrinks them to about +0.4 with intervals that just barely touch zero. This tells us that a 17-team conference can't justify a one-seed-line effect. LOOCV favors the hierarchical fit over both alternatives on out-of-sample predictive accuracy. Complete pooling misses real variation and no pooling overfits. The hierarchical model captures the real cross-conference signal without inflating it past what 15-20 team-seasons can support.
+
+```{r ppc, fig.cap="Posterior Predictive Check for the Hierarchical Model."}
+pp_check(m_hier, ndraws = 100) + 
+  labs(x = "Seed residual (actual - expected)", y = "Density", 
+       title = "Posterior Predictive Check") +
+  theme_minimal(base_size = 10)
+```
+
+The posterior predictive check confirms the model reproduces the residual distribution well. The replicated densities strongly reflect the observed one across the full range, with no systematic tail mismatch, meaning the normality assumption is appropriate for conference-level inference.
+
+To conclude this analysis on conference bias, after controlling for team quality, only three conferences (the SEC, Big East, and Big 12) are credibly over-seeded, by 0.34 to 0.61 seed lines. A handful of mid-majors lean toward being under-seeded but stop just short of credibility. The effects are small, stable across modeling choices, and survive partial-pooling shrinkage, which means they are real but limited.
