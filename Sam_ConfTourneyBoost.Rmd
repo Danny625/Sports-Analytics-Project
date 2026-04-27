@@ -1,13 +1,15 @@
 ---
-title: "NCAA Tournament Seeding: Conference Tournament Seed Boost"
+title: 'NCAA Tournament Seeding: Conference Tournament Seed Boost'
 author: "Sam Sclaver"
 date: "2026-04-25"
 output:
+  word_document:
+    toc: false
   pdf_document:
     toc: false
 header-includes:
-  - \usepackage{float}
-  - \floatplacement{figure}{H}
+- \usepackage{float}
+- \floatplacement{figure}{H}
 ---
 
 ```{r setup, include=FALSE}
@@ -125,7 +127,11 @@ model_data <- model_data |>
 
 The goal of this analysis is to determine whether conference tournament performance provides a systematic seed boost beyond what a team's regular season metrics already predict, and whether this effect varies by conference tier. The outcome variable is the seed residual from the baseline multinomial model (actual seed minus predicted seed), where a positive residual indicates the committee seeded the team worse than predicted and a negative residual indicates the committee was more generous than expected.
 
-The key predictor is the number of conference tournament wins a team accumulated, derived from game-level data in cbbdata by filtering to conference tournament games and counting wins per team per season. To examine whether the per-win effect differs across conference strength, I classified conferences into three tiers based on historical at-large bid rates from 2008 to 2024. At-large bids are awarded to teams that did not win their conference tournament but are deemed worthy by the committee, so a conference's at-large rate reflects how consistently its teams are viewed as tournament-caliber beyond just the automatic bid winner. Power conferences (ACC, Big Ten, Big 12, SEC, Big East, Pac-10/12) have at-large rates above 75\%, mid-major conferences (A-10, Mountain West, AAC, WCC) range from 48 to 68\%, and low-major conferences have at-large rates below 20\%. The Ivy League is classified as low-major despite a 47\% at-large rate because this reflects only `r model_data |> filter(conf == "Ivy") |> nrow()` total tournament appearances and `r model_data |> filter(conf == "Ivy", conf_champ == 0) |> nrow()` at-large bids across 17 seasons, both well below any conference classified as mid-major.
+The key predictor is the number of conference tournament wins a team accumulated, derived from game-level data in cbbdata by filtering to conference tournament games and counting wins per team per season. All baseline model predictors are measured as of Selection Sunday, meaning they already reflect any metric changes from conference tournament performance. This means the seed residual isolates whether the committee rewards conference tournament wins beyond what the updated metrics already capture. 
+
+To examine whether the per-win effect differs across conference strength, I classified conferences into three tiers based on historical at-large bid rates from 2008 to 2024. At-large bids are awarded to teams that did not win their conference tournament but are deemed worthy by the committee, so a conference's at-large rate reflects how consistently its teams are viewed as tournament-caliber beyond just the automatic bid winner. Power conferences (ACC, Big Ten, Big 12, SEC, Big East, Pac-10/12) have at-large rates above 75\%, mid-major conferences (A-10, Mountain West, AAC, WCC) range from 48 to 68\%, and low-major conferences have at-large rates below 20\%. The Ivy League is classified as low-major despite a 47\% at-large rate because this reflects only `r model_data |> filter(conf == "Ivy") |> nrow()` total tournament appearances and `r model_data |> filter(conf == "Ivy", conf_champ == 0) |> nrow()` at-large bids across 17 seasons, both well below any conference classified as mid-major.
+
+Before fitting a formal model, I conducted an initial analysis using the baseline expected seed model to visually assess the raw relationship between conference tournament performance and seed residuals. I calculated the mean seed residual for each exact number of conference tournament wins, grouping the teams by their respective conference tier. To quantify uncertainty in these initial estimates, I computed 95% confidence intervals around each group mean using the standard error of the mean under a normal approximation. This initial step provides a baseline view of the data structure before introducing hierarchical shrinkage.
 
 The primary model is a Bayesian hierarchical model fit using \texttt{brms}:
 
@@ -136,7 +142,9 @@ $$u_{0,j}, u_{1,j} \sim \text{MVN}(0, \Sigma), \quad \epsilon_i \sim \text{Norma
 where $j$ indexes conference tier and $u_{0,j}$ and $u_{1,j}$ are tier-level random intercepts and slopes with partial pooling. Priors are weakly informative: $\text{Normal}(0, 3)$ on fixed effects and $\text{Exponential}(1)$ on standard deviation parameters. The model was fit with 4 chains and 4000 iterations per chain. Partial pooling is appropriate because the per-win effect likely varies across tiers but each tier has limited data, and independent estimation would produce noisy estimates. As a comparison, I fit a simple linear regression without tier structure and a frequentist interaction model with conference tournament wins interacted with tier. Model fit is validated through posterior predictive checks.
 
 
-```{r eda-plot, fig.height=3.5, fig.cap="Average seed residual by conference tournament wins, faceted by conference tier. A positive residual indicates the committee seeded the team worse than the baseline model predicted. Error bars represent 95 percent confidence intervals. Groups with fewer than 10 observations are excluded."}
+### Results
+
+```{r eda-plot, fig.height=3.5, fig.cap="Average seed residual from baseline expected seed model by conference tournament wins, faceted by conference tier. A positive residual indicates the committee seeded the team worse than the baseline model predicted. Error bars represent 95 percent confidence intervals. Groups with fewer than 10 observations are excluded."}
 model_data |>
   filter(conf_t_wins <= 4) |>
   group_by(conf_tier, conf_t_wins) |>
@@ -160,8 +168,6 @@ model_data |>
   theme_minimal()
 ```
 
-### Results
-
 ```{r bayes-model, cache=TRUE, results='hide', message=FALSE}
 bayes_model <- brm(
   seed_residual ~ conf_t_wins + (1 + conf_t_wins | conf_tier),
@@ -177,17 +183,19 @@ bayes_model <- brm(
   iter = 4000,
   warmup = 2000,
   seed = 36460,
-  cores = 4
+  cores = 4,
+  control = list(adapt_delta = 0.99)
 )
 ```
 
 ```{r comparison-models}
 simple_model <- lm(seed_residual ~ conf_t_wins, data = model_data)
 interaction_model <- lm(seed_residual ~ conf_t_wins * conf_tier, data = model_data)
+
 ```
 
 
-```{r tier-slopes, fig.height=3.5, fig.cap="Estimated per-win seed boost by conference tier with 95 percent credible intervals. All three tiers have intervals crossing zero, indicating no credible per-win effect in any tier."}
+```{r tier-slopes, fig.height=3.5, fig.cap="Estimated per-win seed boost from the Bayesian hierarchical model by conference tier with 95 percent credible intervals. All three tiers have intervals crossing zero, indicating no credible per-win effect in any tier."}
 tier_effects <- ranef(bayes_model)$conf_tier[, , "conf_t_wins"]
 fixed_slope <- fixef(bayes_model)["conf_t_wins", "Estimate"]
 
@@ -216,11 +224,15 @@ pp_check(bayes_model, ndraws = 100) +
 ```
 
 
+An initial analysis using the baseline expected seed model reveals no clear pattern suggesting conference tournament wins improve seeding (Figure 1). In power conferences, teams with zero wins have the most negative residuals, with residuals increasing as wins accumulate. Mid-major conferences show a similar pattern with wider uncertainty, while low-major conferences trend slightly negative as wins increase.
 
-Exploratory analysis reveals no clear pattern suggesting conference tournament wins improve seeding (Figure 1). In power conferences, teams with zero wins have the most negative residuals, with residuals increasing as wins accumulate. Mid-major conferences show a similar pattern with wider uncertainty, while low-major conferences trend slightly negative as wins increase.
+The Bayesian hierarchical model estimates an overall per-win effect of `r round(fixef(bayes_model)["conf_t_wins", "Estimate"], 3)` seed lines (95% credible interval: [`r round(fixef(bayes_model)["conf_t_wins", "Q2.5"], 3)`, `r round(fixef(bayes_model)["conf_t_wins", "Q97.5"], 3)`]), with the credible interval comfortably containing zero. Tier-specific slopes are `r round(fixef(bayes_model)["conf_t_wins", "Estimate"] + ranef(bayes_model)$conf_tier[, , "conf_t_wins"]["Power", "Estimate"], 3)` for power, `r round(fixef(bayes_model)["conf_t_wins", "Estimate"] + ranef(bayes_model)$conf_tier[, , "conf_t_wins"]["Mid", "Estimate"], 3)` for mid-major, and `r round(fixef(bayes_model)["conf_t_wins", "Estimate"] + ranef(bayes_model)$conf_tier[, , "conf_t_wins"]["Low", "Estimate"], 3)` for low-major (Figure 2), with all three credible intervals crossing zero.
 
-The Bayesian model estimates an overall per-win effect of `r round(fixef(bayes_model)["conf_t_wins", "Estimate"], 3)` seed lines (95\% credible interval: [`r round(fixef(bayes_model)["conf_t_wins", "Q2.5"], 3)`, `r round(fixef(bayes_model)["conf_t_wins", "Q97.5"], 3)`]), with the credible interval comfortably containing zero, indicating no strong evidence of a systematic per-win effect. Tier-specific slopes are `r round(fixef(bayes_model)["conf_t_wins", "Estimate"] + ranef(bayes_model)$conf_tier[, , "conf_t_wins"]["Power", "Estimate"], 3)` for power, `r round(fixef(bayes_model)["conf_t_wins", "Estimate"] + ranef(bayes_model)$conf_tier[, , "conf_t_wins"]["Mid", "Estimate"], 3)` for mid-major, and `r round(fixef(bayes_model)["conf_t_wins", "Estimate"] + ranef(bayes_model)$conf_tier[, , "conf_t_wins"]["Low", "Estimate"], 3)` for low-major (Figure 2), with all three credible intervals crossing zero. The low-major negative slope is expected: these teams almost exclusively reach the tournament by winning their conference tournament, so their wins are not new information to the committee but a prerequisite for being in the field.
+The divergence between low-major and the other two tiers is not surprising when considering how teams from these conferences reach the tournament. Power and some mid-major conference teams frequently earn at-large bids based on their regular season resume alone, meaning conference tournament performance is additional information on top of an already established profile. Low-major teams, by contrast, pretty much exclusively reach the tournament by winning their conference tournament, so their conference tournament wins are not new information to the committee but rather the prerequisite for being in the field at all. These are teams that don't have the resume to get in the tournament without an auto-bid (winning their conference tournament), which explains why the low-major per-win slope trends slightly negative rather than positive.
 
-The simple linear regression estimates a per-win effect of `r round(coef(simple_model)["conf_t_wins"], 3)` ($p < 0.001$), but the interaction model reveals this differs by tier, with low-major conferences showing a significant negative interaction (estimate = `r round(coef(interaction_model)["conf_t_wins:conf_tierLow"], 3)`, $p$ < 0.001). The Bayesian model, through partial pooling, appropriately shrinks all estimates toward zero, reflecting the genuine uncertainty. Posterior predictive checks (Figure 3) confirm the model captures the overall spread of residuals, though it does not replicate the discrete integer structure of the observed data. The overall model explains only `r round(summary(interaction_model)$r.squared * 100, 1)`\% of variance in seed residuals.
+To validate, I compared against two frequentist models. The simple linear regression estimates a per-win effect of `r round(coef(simple_model)["conf_t_wins"], 3)` ($p < 0.001$), but this is misleading because it pools all tiers. The interaction model separates tiers, with slopes of `r round(coef(interaction_model)["conf_t_wins"], 3)` for power, `r round(coef(interaction_model)["conf_t_wins"] + coef(interaction_model)["conf_t_wins:conf_tierMid"], 3)` for mid-major, and `r round(coef(interaction_model)["conf_t_wins"] + coef(interaction_model)["conf_t_wins:conf_tierLow"], 3)` for low-major, with the low-major interaction significant at $p < 0.001$. The Bayesian model produces similar tier-specific slopes but shrinks all estimates toward zero through partial pooling. The frequentist interaction model explains only `r round(summary(interaction_model)$r.squared * 100, 1)`\% of variance in seed residuals, confirming that conference tournament performance accounts for a very small portion of seeding deviations.
 
-The central finding is that the NCAA selection committee does not appear to systematically reward or penalize conference tournament performance beyond what regular season metrics already capture. While conference tournament results are known to be one of many factors the committee considers, this analysis suggests their influence on seeding is minimal once team quality is controlled for.
+Posterior predictive checks (Figure 3) confirm the model captures the overall spread of residuals, though the Gaussian likelihood produces smooth simulated distributions that do not replicate the discrete integer structure of the observed data. The model was fit with adapt\_delta = 0.99, with 22 divergent transitions remaining out of 8000 draws, attributable to estimating hierarchical variance components with only three grouping levels.
+
+The central finding is that the NCAA selection committee does not appear to systematically reward or penalize conference tournament performance beyond what regular season metrics already capture. While conference tournament results are known to be one of many factors the committee considers, this analysis suggests their influence on seeding is minimal once team quality is controlled for. This holds across all three conference tiers and is robust to model specification, with both the Bayesian hierarchical model and the frequentist interaction model pointing to the same conclusion. The committee appears to evaluate teams primarily on their full body of work as captured by metrics like WAB and adjusted efficiency, rather than giving additional weight to late-season conference tournament runs.
+
