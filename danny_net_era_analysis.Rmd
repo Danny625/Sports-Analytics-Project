@@ -53,13 +53,13 @@ set.seed(460)
 
 ## Data and Sample
 
-I exported the Torvik team-season data from `cbbdata` to a local CSV first, then used that file here so the analysis does not depend on live API calls while knitting.
+I pulled the Torvik team-season data through `cbbdata` once, saved it as a local CSV, and then used that file for the rest of this analysis. That way the report does not depend on live API calls every time it gets knitted.
 
 ```{r load-data}
 raw_data <- readr::read_csv("torvik_ratings_2008_2024.csv", show_col_types = FALSE)
 ```
 
-The Torvik export includes team quality metrics and NCAA seeds by season. For this section, I only keep seeded teams, drop 2020 because there was no NCAA tournament, and create a `post_net` indicator for 2019 and later.
+The dataset includes team quality metrics along with NCAA tournament seeds by season. For my section, I keep seeded teams only, drop 2020 because there was no NCAA tournament, and create a `post_net` indicator for 2019 and later so I can compare the pre-NET and post-NET eras directly.
 
 ```{r build-data}
 predictor_lookup <- tibble(
@@ -118,13 +118,13 @@ sample_summary <- tibble(
   seasons_used = paste0(min(model_data$year), "-", max(model_data$year), ", excluding 2020")
 )
 
-kable(sample_summary, caption = "Analytic sample used in Danny's NET-era seeding analysis.")
+kable(sample_summary, caption = "Sample used for my NET-era seeding analysis.")
 ```
 
 ```{r variable-guide}
 kable(
   predictor_lookup,
-  caption = "Plain-English guide to the predictor variables used in Danny's model."
+  caption = "Main variables used in my model and what they mean."
 )
 ```
 
